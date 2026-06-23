@@ -1,817 +1,290 @@
-html,body {
-    padding: 0;
-    margin: 0;
-    background: #000;
-    width: 100vw;
-    height: 100vh;
-    overflow: hidden
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    #container { width: 100%; height: 100%; position: relative; }
+    video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+    iframe { width: 100%; height: 100%; border: none; }
+    #yt-player { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="container"></div>
+
+<script>
+// ============================================================
+// rMedia DUI Player – Supports YouTube, Twitch, HLS, Direct Media
+// Controlled entirely via postMessage from Lua (SendDuiMessage)
+//
+// IMPORTANT: This file is designed to be hosted externally
+// (GitHub Pages, personal website, etc.) so it MUST NOT use
+// fetch() to communicate back to FiveM (CSP blocks it).
+// All communication is ONE-WAY: Lua -> DUI via SendDuiMessage.
+// ============================================================
+
+const container = document.getElementById('container');
+const params = new URLSearchParams(window.location.search);
+const MEDIA_ID = params.get('id');
+const RESOURCE = params.get('res') || 'rMedia';
+
+let currentPlayer = null;   // Reference to active player (video element or YT player)
+let currentType = null;      // 'youtube' | 'twitch' | 'hls' | 'direct'
+let hlsInstance = null;
+let ytReady = false;
+let pendingPlay = null;
+
+// ---- YouTube IFrame API ----
+// Load the API script dynamically (may fail on hosts with strict CSP,
+// but YouTube playback is not critical for direct media).
+try {
+    const ytScript = document.createElement('script');
+    ytScript.src = 'https://www.youtube.com/iframe_api';
+    ytScript.onerror = function() {
+        console.warn('[rMedia] YouTube IFrame API failed to load (CSP or network). YouTube playback will be unavailable.');
+    };
+    document.head.appendChild(ytScript);
+} catch(e) {
+    console.warn('[rMedia] Could not load YouTube API:', e);
 }
 
-#loading {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100vw;
-    height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: #000c;
-    z-index: 9999
+window.onYouTubeIframeAPIReady = function() {
+    ytReady = true;
+    if (pendingPlay && pendingPlay.mediaType === 'youtube') {
+        playYouTube(pendingPlay);
+        pendingPlay = null;
+    }
+};
+
+// ---- HLS.js (loaded lazily) ----
+let hlsJsLoaded = false;
+function loadHlsJs(cb) {
+    if (hlsJsLoaded) { cb(); return; }
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js';
+    s.onload = function() { hlsJsLoaded = true; cb(); };
+    s.onerror = function() { console.error('[rMedia] Failed to load hls.js'); };
+    document.head.appendChild(s);
 }
 
-.spinner {
-    width: 60px;
-    height: 60px;
-    border: 4px solid rgba(255,255,255,.1);
-    border-top-color: #fff;
-    border-radius: 50%;
-    animation: spin 1s linear infinite
+// ---- URL Type Detection ----
+function detectType(url) {
+    const lower = url.toLowerCase();
+    if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'youtube';
+    if (lower.includes('twitch.tv')) return 'twitch';
+    if (lower.includes('.m3u8')) return 'hls';
+    return 'direct';
 }
 
-@keyframes spin {
-    to {
-        transform: rotate(360deg)
+// ---- Extract YouTube Video ID ----
+function extractYouTubeId(url) {
+    let m = url.match(/youtu\.be\/([a-zA-Z0-9_-]+)/);
+    if (m) return m[1];
+    m = url.match(/[?&]v=([a-zA-Z0-9_-]+)/);
+    if (m) return m[1];
+    m = url.match(/embed\/([a-zA-Z0-9_-]+)/);
+    if (m) return m[1];
+    m = url.match(/live\/([a-zA-Z0-9_-]+)/);
+    if (m) return m[1];
+    return null;
+}
+
+// ---- Extract Twitch Channel ----
+function extractTwitchChannel(url) {
+    const m = url.match(/twitch\.tv\/([a-zA-Z0-9_]+)/);
+    return m ? m[1] : null;
+}
+
+// ---- Cleanup current player ----
+function cleanup() {
+    if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+    if (currentPlayer && currentType === 'youtube' && currentPlayer.destroy) {
+        try { currentPlayer.destroy(); } catch(e) {}
+    }
+    container.innerHTML = '';
+    currentPlayer = null;
+    currentType = null;
+}
+
+// ---- Play: YouTube ----
+function playYouTube(opts) {
+    cleanup();
+    currentType = 'youtube';
+    const videoId = extractYouTubeId(opts.url);
+    if (!videoId) { console.error('[rMedia] Invalid YouTube URL:', opts.url); return; }
+
+    const div = document.createElement('div');
+    div.id = 'yt-player';
+    container.appendChild(div);
+
+    currentPlayer = new YT.Player('yt-player', {
+        host: 'https://www.youtube-nocookie.com',
+        videoId: videoId,
+        playerVars: {
+            autoplay: 1,
+            controls: 0,
+            disablekb: 1,
+            fs: 0,
+            modestbranding: 1,
+            rel: 0,
+            showinfo: 0,
+            iv_load_policy: 3,
+            start: Math.floor(opts.offset || 0),
+            loop: opts.loop ? 1 : 0,
+            playlist: opts.loop ? videoId : undefined,
+            origin: window.location.origin,
+            enablejsapi: 1
+        },
+        events: {
+            onReady: function(e) {
+                e.target.setVolume(0); // Audio handled by NUI ReactPlayer
+                e.target.playVideo();
+            },
+            onStateChange: function(e) {
+                // ended state handled by Lua via duration
+            }
+        }
+    });
+}
+
+// ---- Play: Twitch ----
+function playTwitch(opts) {
+    cleanup();
+    currentType = 'twitch';
+    const channel = extractTwitchChannel(opts.url);
+    if (!channel) { console.error('[rMedia] Invalid Twitch URL:', opts.url); return; }
+
+    // Use the current hostname as parent for Twitch embed
+    const parentHost = window.location.hostname || 'localhost';
+    const iframe = document.createElement('iframe');
+    iframe.src = `https://player.twitch.tv/?channel=${channel}&parent=${parentHost}&muted=false&autoplay=true`;
+    iframe.allow = 'autoplay';
+    container.appendChild(iframe);
+    currentPlayer = iframe;
+}
+
+// ---- Play: HLS ----
+function playHLS(opts) {
+    cleanup();
+    currentType = 'hls';
+
+    loadHlsJs(function() {
+        const video = document.createElement('video');
+        video.autoplay = true;
+        video.muted = true; // Audio handled by NUI ReactPlayer
+        video.loop = !!opts.loop;
+        container.appendChild(video);
+        currentPlayer = video;
+
+        if (Hls.isSupported()) {
+            hlsInstance = new Hls();
+            hlsInstance.loadSource(opts.url);
+            hlsInstance.attachMedia(video);
+            hlsInstance.on(Hls.Events.MANIFEST_PARSED, function() {
+                video.play().catch(e => console.warn(e));
+                if (opts.offset > 0) video.currentTime = opts.offset;
+            });
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = opts.url;
+            video.addEventListener('loadedmetadata', function() {
+                video.play().catch(e => console.warn(e));
+                if (opts.offset > 0) video.currentTime = opts.offset;
+            });
+        }
+    });
+}
+
+// ---- Play: Direct Media ----
+function playDirect(opts) {
+    cleanup();
+    currentType = 'direct';
+
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.muted = true; // Audio handled by NUI ReactPlayer
+    video.loop = !!opts.loop;
+    video.src = opts.url;
+    container.appendChild(video);
+    currentPlayer = video;
+
+    video.addEventListener('loadedmetadata', function() {
+        if (opts.offset > 0) video.currentTime = opts.offset;
+    });
+
+    video.play().catch(e => console.warn(e));
+}
+
+// ---- Unified Play ----
+function play(opts) {
+    const type = opts.mediaType || detectType(opts.url);
+
+    switch (type) {
+        case 'youtube':
+            if (ytReady) { playYouTube(opts); }
+            else { pendingPlay = opts; pendingPlay.mediaType = 'youtube'; }
+            break;
+        case 'twitch':  playTwitch(opts); break;
+        case 'hls':     playHLS(opts); break;
+        default:        playDirect(opts); break;
     }
 }
 
-.player-wrapper {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100vw;
-    height: 100vh
-}
-
-.player-wrapper>iframe,.player-wrapper>video {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    padding: 0;
-    margin: 0;
-    border: none
-}
-
-canvas.visualization {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    pointer-events: none
-}
-
-.mejs__offscreen {
-    border: 0;
-    clip: rect(1px,1px,1px,1px);
-    -webkit-clip-path: inset(50%);
-    clip-path: inset(50%);
-    height: 1px;
-    margin: -1px;
-    overflow: hidden;
-    padding: 0;
-    position: absolute;
-    width: 1px;
-    word-wrap: normal
-}
-
-.mejs__container {
-    background: #000;
-    font-family: Helvetica,Arial,serif;
-    position: relative;
-    text-align: left;
-    text-indent: 0;
-    vertical-align: top
-}
-
-.mejs__container,.mejs__container * {
-    box-sizing: border-box
-}
-
-.mejs__container video::-webkit-media-controls,.mejs__container video::-webkit-media-controls-panel,.mejs__container video::-webkit-media-controls-panel-container,.mejs__container video::-webkit-media-controls-start-playback-button {
-    -webkit-appearance: none;
-    display: none!important
-}
-
-.mejs__fill-container,.mejs__fill-container .mejs__container {
-    height: 100%;
-    width: 100%
-}
-
-.mejs__fill-container {
-    background: transparent;
-    margin: 0 auto;
-    overflow: hidden;
-    position: relative
-}
-
-.mejs__container:focus {
-    outline-offset: .125rem;
-    outline-style: solid;
-    outline-width: .125rem
-}
-
-.mejs__iframe-overlay {
-    height: 100%;
-    position: absolute;
-    width: 100%
-}
-
-.mejs__embed,.mejs__embed body {
-    background: #000;
-    height: 100%;
-    margin: 0;
-    overflow: hidden;
-    padding: 0;
-    width: 100%
-}
-
-.mejs__fullscreen {
-    overflow: hidden!important
-}
-
-.mejs__container-fullscreen {
-    bottom: 0;
-    left: 0;
-    overflow: hidden;
-    position: fixed;
-    right: 0;
-    top: 0;
-    z-index: 1000
-}
-
-.mejs__container-fullscreen video {
-    height: 100vh!important;
-    left: 50%!important;
-    object-fit: contain;
-    position: fixed!important;
-    top: 50%!important;
-    -webkit-transform: translate(-50%,-50%)!important;
-    -ms-transform: translate(-50%,-50%)!important;
-    transform: translate(-50%,-50%)!important;
-    width: 100vw!important
-}
-
-.mejs__background,.mejs__mediaelement {
-    left: 0;
-    position: absolute;
-    top: 0
-}
-
-.mejs__mediaelement {
-    height: 100%;
-    width: 100%;
-    z-index: 0
-}
-
-.mejs__poster {
-    background-position: 50% 50%;
-    background-repeat: no-repeat;
-    background-size: cover;
-    left: 0;
-    position: absolute;
-    top: 0;
-    z-index: 1
-}
-
-:root .mejs__poster-img {
-    display: none
-}
-
-.mejs__poster-img {
-    border: 0;
-    padding: 0
-}
-
-.mejs__overlay {
-    -webkit-box-align: center;
-    -webkit-align-items: center;
-    -ms-flex-align: center;
-    align-items: center;
-    display: -webkit-box;
-    display: -webkit-flex;
-    display: -ms-flexbox;
-    display: flex;
-    -webkit-box-pack: center;
-    -webkit-justify-content: center;
-    -ms-flex-pack: center;
-    justify-content: center;
-    left: 0;
-    position: absolute;
-    top: 0
-}
-
-.mejs__layer {
-    z-index: 1
-}
-
-.mejs__overlay-play {
-    cursor: pointer
-}
-
-.mejs__overlay-button {
-    background: transparent;
-    border: 0
-}
-
-.mejs__overlay:hover .mejs__overlay-button svg {
-    opacity: 1
-}
-
-.mejs__overlay-button svg {
-    opacity: .75
-}
-
-.mejs__overlay-button:focus svg {
-    opacity: 1
-}
-
-.mejs__overlay-button,.mejs__overlay-button svg,.mejs__overlay-loading,.mejs__overlay-loading svg {
-    height: 5rem;
-    width: 5rem
-}
-
-.mejs__overlay-loading-bg-img {
-    -webkit-animation: a 1s linear infinite;
-    animation: a 1s linear infinite;
-    display: block;
-    height: 5rem;
-    width: 5rem;
-    z-index: 1
-}
-
-@-webkit-keyframes a {
-    to {
-        -webkit-transform: rotate(1turn);
-        transform: rotate(1turn)
+// ---- Volume Control ----
+function setVolume(vol) {
+    const v = Math.max(0, Math.min(100, vol));
+    if (currentType === 'youtube' && currentPlayer && currentPlayer.setVolume) {
+        currentPlayer.setVolume(v);
+    } else if (currentPlayer && currentPlayer.volume !== undefined) {
+        currentPlayer.volume = v / 100;
     }
 }
 
-@keyframes a {
-    to {
-        -webkit-transform: rotate(1turn);
-        transform: rotate(1turn)
+// ---- Pause / Resume ----
+function setPaused(paused) {
+    if (currentType === 'youtube' && currentPlayer) {
+        paused ? currentPlayer.pauseVideo() : currentPlayer.playVideo();
+    } else if (currentPlayer) {
+        paused ? currentPlayer.pause() : currentPlayer.play().catch(e => console.warn(e));
     }
 }
 
-.mejs__controls {
-    bottom: 0;
-    display: -webkit-box;
-    display: -webkit-flex;
-    display: -ms-flexbox;
-    display: flex;
-    height: 2.5rem;
-    left: 0;
-    list-style-type: none;
-    margin: 0;
-    padding: 0 .625rem;
-    position: absolute;
-    width: 100%;
-    z-index: 3
-}
-
-.mejs__controls:not([style*="display: none"]) {
-    background: #ff0000b3;
-    background: -webkit-linear-gradient(transparent,rgba(0,0,0,.35));
-    background: linear-gradient(transparent,#00000059)
-}
-
-.mejs__button,.mejs__time,.mejs__time-rail {
-    font-size: .625rem;
-    height: 2.5rem;
-    line-height: .625rem;
-    margin: 0;
-    width: 2rem
-}
-
-.mejs__button>button {
-    background-color: transparent;
-    border: 0;
-    color: #fff;
-    cursor: pointer;
-    display: block;
-    font-size: 0;
-    height: 1.125rem;
-    line-height: 0;
-    margin: .625rem .375rem;
-    overflow: hidden;
-    padding: 0;
-    position: absolute;
-    text-decoration: none;
-    width: 1.125rem
-}
-
-.mejs__button svg {
-    fill: currentColor;
-    height: 1.125rem;
-    width: 1.125rem
-}
-
-.mejs__button>button:focus {
-    outline: .125rem dotted #fff
-}
-
-.mejs__container-keyboard-inactive [role=slider],.mejs__container-keyboard-inactive [role=slider]:focus,.mejs__container-keyboard-inactive a,.mejs__container-keyboard-inactive a:focus,.mejs__container-keyboard-inactive button,.mejs__container-keyboard-inactive button:focus {
-    outline: 0
-}
-
-.mejs__playpause-button svg {
-    display: none
-}
-
-.mejs__pause svg.mejs__icon-pause,.mejs__play svg.mejs__icon-play,.mejs__replay svg.mejs__icon-replay {
-    display: block
-}
-
-.mejs__fullscreen-button svg.mejs__icon-unfullscreen {
-    display: none
-}
-
-.mejs__fullscreen svg.mejs__icon-fullscreen {
-    display: block
-}
-
-.mejs__fullscreen svg.mejs__icon-unfullscreen {
-    display: none
-}
-
-.mejs__unfullscreen svg.mejs__icon-unfullscreen {
-    display: block
-}
-
-.mejs__unfullscreen svg.mejs__icon-fullscreen {
-    display: none
-}
-
-.mejs__time {
-    box-sizing: content-box;
-    color: #fff;
-    font-size: .6875rem;
-    font-weight: 700;
-    height: 1.5rem;
-    overflow: hidden;
-    padding: 1rem .375rem 0;
-    text-align: center;
-    width: auto
-}
-
-.mejs__time-rail {
-    direction: ltr;
-    -webkit-box-flex: 1;
-    -webkit-flex-grow: 1;
-    -ms-flex-positive: 1;
-    flex-grow: 1;
-    height: 2.5rem;
-    margin: 0 .625rem;
-    padding-top: .625rem;
-    position: relative
-}
-
-.mejs__time-buffering,.mejs__time-current,.mejs__time-float,.mejs__time-float-corner,.mejs__time-float-current,.mejs__time-hovered,.mejs__time-loaded,.mejs__time-marker,.mejs__time-total {
-    border-radius: .125rem;
-    cursor: pointer;
-    display: block;
-    height: .625rem;
-    position: absolute
-}
-
-.mejs__time-total {
-    background: #ffffff4d;
-    margin: .3125rem 0 0;
-    width: 100%
-}
-
-.mejs__time-buffering {
-    -webkit-animation: b 2s linear infinite;
-    animation: b 2s linear infinite;
-    background: -webkit-linear-gradient(135deg,hsla(0,0%,100%,.4) 25%,transparent 0,transparent 50%,hsla(0,0%,100%,.4) 0,hsla(0,0%,100%,.4) 75%,transparent 0,transparent);
-    background: linear-gradient(-45deg,hsla(0,0%,100%,.4) 25%,transparent 0,transparent 50%,hsla(0,0%,100%,.4) 0,hsla(0,0%,100%,.4) 75%,transparent 0,transparent);
-    background-size: .9375rem .9375rem;
-    width: 100%
-}
-
-@-webkit-keyframes b {
-    0% {
-        background-position: 0 0
-    }
-
-    to {
-        background-position: 1.875rem 0
+// ---- Seek ----
+function seek(time) {
+    if (currentType === 'youtube' && currentPlayer && currentPlayer.seekTo) {
+        currentPlayer.seekTo(time, true);
+    } else if (currentPlayer) {
+        currentPlayer.currentTime = time;
     }
 }
 
-@keyframes b {
-    0% {
-        background-position: 0 0
+// ---- Message Handler (from Lua via SendDuiMessage) ----
+window.addEventListener('message', function(event) {
+    const data = event.data;
+    if (!data || !data.type) return;
+
+    switch (data.type) {
+        case 'play':
+            play(data);
+            break;
+        case 'stop':
+            cleanup();
+            break;
+        case 'pause':
+            setPaused(true);
+            break;
+        case 'resume':
+            setPaused(false);
+            break;
+        case 'volume':
+            setVolume(data.volume);
+            break;
+        case 'seek':
+            seek(data.time);
+            break;
     }
-
-    to {
-        background-position: 1.875rem 0
-    }
-}
-
-.mejs__time-loaded {
-    background: #ffffff4d
-}
-
-.mejs__time-current,.mejs__time-handle-content {
-    background: #ffffffe6
-}
-
-.mejs__time-hovered {
-    background: #ffffff80;
-    z-index: 10
-}
-
-.mejs__time-hovered.negative {
-    background: #0003
-}
-
-.mejs__time-buffering,.mejs__time-current,.mejs__time-hovered,.mejs__time-loaded {
-    left: 0;
-    -webkit-transform: scaleX(0);
-    -ms-transform: scaleX(0);
-    transform: scaleX(0);
-    -webkit-transform-origin: 0 0;
-    -ms-transform-origin: 0 0;
-    transform-origin: 0 0;
-    -webkit-transition: all .15s ease-in;
-    transition: all .15s ease-in;
-    width: 100%
-}
-
-.mejs__time-buffering {
-    -webkit-transform: scaleX(1);
-    -ms-transform: scaleX(1);
-    transform: scaleX(1)
-}
-
-.mejs__time-hovered {
-    -webkit-transition: height .1s cubic-bezier(.44,0,1,1);
-    transition: height .1s cubic-bezier(.44,0,1,1)
-}
-
-.mejs__time-hovered.no-hover {
-    -webkit-transform: scaleX(0)!important;
-    -ms-transform: scaleX(0)!important;
-    transform: scaleX(0)!important
-}
-
-.mejs__time-handle,.mejs__time-handle-content {
-    border: .25rem solid transparent;
-    cursor: pointer;
-    left: 0;
-    position: absolute;
-    -webkit-transform: translateX(0);
-    -ms-transform: translateX(0);
-    transform: translate(0);
-    z-index: 11
-}
-
-.mejs__time-handle-content {
-    border: .25rem solid hsla(0,0%,100%,.9);
-    border-radius: 50%;
-    height: .625rem;
-    left: -.4375rem;
-    top: -.25rem;
-    -webkit-transform: scale(0);
-    -ms-transform: scale(0);
-    transform: scale(0);
-    width: .625rem
-}
-
-.mejs__time-rail .mejs__time-handle-content:active,.mejs__time-rail .mejs__time-handle-content:focus,.mejs__time-rail:hover .mejs__time-handle-content {
-    -webkit-transform: scale(1);
-    -ms-transform: scale(1);
-    transform: scale(1)
-}
-
-.mejs__time-float {
-    background: #eee;
-    border: 1px solid #333;
-    bottom: 100%;
-    color: #111;
-    display: none;
-    height: 1.0625rem;
-    margin-bottom: .5625rem;
-    position: absolute;
-    text-align: center;
-    -webkit-transform: translateX(-50%);
-    -ms-transform: translateX(-50%);
-    transform: translate(-50%);
-    width: 2.25rem
-}
-
-.mejs__time-float-current {
-    display: block;
-    left: 0;
-    margin: .125rem;
-    text-align: center;
-    width: 1.875rem
-}
-
-.mejs__time-float-corner {
-    border: .3125rem solid #eee;
-    border-color: #eee transparent transparent;
-    border-radius: 0;
-    display: block;
-    height: 0;
-    left: 50%;
-    line-height: 0;
-    position: absolute;
-    top: 100%;
-    -webkit-transform: translateX(-50%);
-    -ms-transform: translateX(-50%);
-    transform: translate(-50%);
-    width: 0
-}
-
-.mejs__long-video .mejs__time-float {
-    margin-left: -1.4375rem;
-    width: 4rem
-}
-
-.mejs__long-video .mejs__time-float-current {
-    width: 3.75rem
-}
-
-.mejs__broadcast {
-    color: #fff;
-    height: .625rem;
-    position: absolute;
-    top: .9375rem;
-    width: 100%
-}
-
-.mejs__volume-button {
-    position: relative
-}
-
-.mejs__volume-button>.mejs__volume-slider {
-    -webkit-backface-visibility: hidden;
-    background: #323232b3;
-    border-radius: 0;
-    bottom: 100%;
-    display: none;
-    height: 7.1875rem;
-    left: 50%;
-    margin: 0;
-    position: absolute;
-    -webkit-transform: translateX(-50%);
-    -ms-transform: translateX(-50%);
-    transform: translate(-50%);
-    width: 1.5625rem;
-    z-index: 1
-}
-
-.mejs__volume-button:hover {
-    border-radius: 0 0 .25rem .25rem
-}
-
-.mejs__volume-total {
-    background: #ffffff80;
-    border: .06rem solid #fff;
-    height: 6.25rem;
-    left: 50%;
-    margin: 0;
-    position: absolute;
-    top: .5rem;
-    -webkit-transform: translateX(-50%);
-    -ms-transform: translateX(-50%);
-    transform: translate(-50%);
-    width: .125rem
-}
-
-.mejs__volume-current {
-    left: 0;
-    margin: 0;
-    width: 100%
-}
-
-.mejs__volume-current,.mejs__volume-handle {
-    background: #ffffffe6;
-    position: absolute
-}
-
-.mejs__volume-handle {
-    border: 1px solid #fff;
-    border-radius: 1px;
-    cursor: ns-resize;
-    height: .375rem;
-    left: 50%;
-    -webkit-transform: translateX(-50%);
-    -ms-transform: translateX(-50%);
-    transform: translate(-50%);
-    width: 1rem
-}
-
-.mejs__horizontal-volume-slider {
-    display: block;
-    height: 2.25rem;
-    position: relative;
-    vertical-align: middle;
-    width: 3.5rem
-}
-
-.mejs__horizontal-volume-total {
-    background: #323232cc;
-    border: .06rem solid #fff;
-    border-radius: .125rem;
-    font-size: 1px;
-    height: .5rem;
-    left: 0;
-    margin: 0;
-    padding: 0;
-    position: absolute;
-    top: 1rem;
-    width: 3.125rem
-}
-
-.mejs__horizontal-volume-current {
-    background: #fffc;
-    border-radius: .125rem;
-    border-right: .06rem solid #fff;
-    font-size: 1px;
-    height: 100%;
-    left: 0;
-    margin: 0;
-    padding: 0;
-    position: absolute;
-    top: 0;
-    width: 100%
-}
-
-.mejs__horizontal-volume-handle {
-    display: none
-}
-
-.mejs__mute svg,.mejs__unmute svg {
-    stroke: currentColor
-}
-
-.mejs__volume-button svg {
-    display: none
-}
-
-.mejs__mute .mejs__icon-mute,.mejs__unmute .mejs__icon-unmute {
-    display: block
-}
-
-.mejs__captions-button,.mejs__chapters-button {
-    position: relative
-}
-
-.mejs__captions-button svg,.mejs__chapters-button svg {
-    padding-top: .125rem
-}
-
-.mejs__captions-button>.mejs__captions-selector,.mejs__chapters-button>.mejs__chapters-selector {
-    background: #323232b3;
-    border: 1px solid transparent;
-    border-radius: 0;
-    bottom: 100%;
-    margin-right: -2.6875rem;
-    overflow: hidden;
-    padding: 0;
-    position: absolute;
-    right: 50%;
-    visibility: visible;
-    width: 5.375rem
-}
-
-.mejs__captions-button-toggle {
-    opacity: .7
-}
-
-.mejs__captions-button-toggle-on {
-    opacity: 1
-}
-
-.mejs__chapters-button>.mejs__chapters-selector {
-    margin-right: -3.4375rem;
-    width: 6.875rem
-}
-
-.mejs__captions-selector-list,.mejs__chapters-selector-list {
-    list-style-type: none!important;
-    margin: 0;
-    overflow: hidden;
-    padding: 0
-}
-
-.mejs__captions-selector-list-item,.mejs__chapters-selector-list-item {
-    color: #fff;
-    cursor: pointer;
-    display: block;
-    list-style-type: none!important;
-    margin: 0 0 .375rem;
-    overflow: hidden;
-    padding: 0
-}
-
-.mejs__captions-selector-list-item:hover,.mejs__chapters-selector-list-item:hover {
-    background-color: #c8c8c8!important;
-    background-color: #fff6!important
-}
-
-.mejs__captions-selector-input,.mejs__chapters-selector-input {
-    clear: both;
-    float: left;
-    left: -62.5rem;
-    margin: .1875rem .1875rem 0 .3125rem;
-    position: absolute
-}
-
-.mejs__captions-selector-label,.mejs__chapters-selector-label {
-    cursor: pointer;
-    float: left;
-    font-size: .625rem;
-    line-height: .9375rem;
-    padding: .25rem .625rem 0;
-    width: 100%
-}
-
-.mejs__captions-selector-list-item:hover .mejs__captions-selector-label,.mejs__chapters-selector-list-item:hover .mejs__chapters-selector-label {
-    text-decoration: underline
-}
-
-.mejs__captions-selected,.mejs__chapters-selected {
-    color: #21f8f8;
-    font-weight: 700
-}
-
-.mejs__captions-translations {
-    font-size: .625rem;
-    margin: 0 0 .3125rem
-}
-
-.mejs__captions-layer {
-    bottom: 0;
-    color: #fff;
-    font-size: 1rem;
-    left: 0;
-    line-height: 1.25rem;
-    position: absolute;
-    text-align: center
-}
-
-.mejs__captions-layer a {
-    color: #fff;
-    text-decoration: underline
-}
-
-.mejs__captions-layer[lang=ar] {
-    font-size: 1.25rem;
-    font-weight: 400
-}
-
-.mejs__captions-position {
-    bottom: .9375rem;
-    left: 0;
-    position: absolute;
-    width: 100%
-}
-
-.mejs__captions-position-hover {
-    bottom: 2.1875rem
-}
-
-.mejs__captions-text,.mejs__captions-text * {
-    background: #14141480;
-    box-shadow: .3125rem 0 #14141480,-.3125rem 0 #14141480;
-    padding: 0;
-    white-space: pre-wrap
-}
-
-.mejs__container.mejs__hide-cues video::-webkit-media-text-track-container {
-    display: none
-}
-
-.mejs__overlay-error {
-    position: relative
-}
-
-.mejs__overlay-error>img {
-    left: 0;
-    max-width: 100%;
-    position: absolute;
-    top: 0;
-    z-index: -1
-}
-
-.mejs__cannotplay,.mejs__cannotplay a {
-    color: #fff;
-    font-size: .8em
-}
-
-.mejs__cannotplay {
-    position: relative
-}
-
-.mejs__cannotplay a,.mejs__cannotplay p {
-    display: inline-block;
-    padding: 0 .9375rem;
-    width: 100%
-}
+});
+</script>
+</body>
+</html>
