@@ -107,6 +107,7 @@ function playYouTube(opts) {
     container.appendChild(div);
 
     currentPlayer = new YT.Player('yt-player', {
+        host: 'https://www.youtube-nocookie.com',
         videoId: videoId,
         playerVars: {
             autoplay: 1,
