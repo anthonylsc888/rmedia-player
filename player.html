@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+    #container { width: 100%; height: 100%; position: relative; }
+    video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+    iframe { width: 100%; height: 100%; border: none; }
+    #yt-player { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="container"></div>
+
+<script>
+// ============================================================
+// rMedia DUI Player – Supports YouTube, Twitch, HLS, Direct Media
+// Controlled entirely via postMessage from Lua (SendDuiMessage)
+// ============================================================
+
+const container = document.getElementById('container');
+const params = new URLSearchParams(window.location.search);
+const MEDIA_ID = params.get('id');
+const RESOURCE = params.get('res') || 'rMedia';
+
+let currentPlayer = null;   // Reference to active player (video element or YT player)
+let currentType = null;      // 'youtube' | 'twitch' | 'hls' | 'direct'
+let hlsInstance = null;
+let ytReady = false;
+let pendingPlay = null;
+
+// ---- YouTube IFrame API ----
+// Load the API script dynamically
+const ytScript = document.createElement('script');
+ytScript.src = 'https://www.youtube.com/iframe_api';
+document.head.appendChild(ytScript);
+
+window.onYouTubeIframeAPIReady = function() {
+    ytReady = true;
+    if (pendingPlay && pendingPlay.mediaType === 'youtube') {
+        playYouTube(pendingPlay);
+        pendingPlay = null;
+    }
+};
+
+// ---- HLS.js (loaded lazily) ----
+let hlsJsLoaded = false;
+function loadHlsJs(cb) {
+    if (hlsJsLoaded) { cb(); return; }
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js';
+    s.onload = function() { hlsJsLoaded = true; cb(); };
+    s.onerror = function() { console.error('Failed to load hls.js'); };
+    document.head.appendChild(s);
+}
+
+// ---- URL Type Detection ----
+function detectType(url) {
+    const lower = url.toLowerCase();
+    if (lower.includes('youtube.com') || lower.includes('youtu.be')) return 'youtube';
+    if (lower.includes('twitch.tv')) return 'twitch';
+    if (lower.includes('.m3u8')) return 'hls';
+    return 'direct';
+}
+
+// ---- Extract YouTube Video ID ----
+function extractYouTubeId(url) {
+    let m = url.match(/youtu\.be\/([a-zA-Z0-9_-]+)/);
+    if (m) return m[1];
+    m = url.match(/[?&]v=([a-zA-Z0-9_-]+)/);
+    if (m) return m[1];
+    m = url.match(/embed\/([a-zA-Z0-9_-]+)/);
+    if (m) return m[1];
+    m = url.match(/live\/([a-zA-Z0-9_-]+)/);
+    if (m) return m[1];
+    return null;
+}
+
+// ---- Extract Twitch Channel ----
+function extractTwitchChannel(url) {
+    const m = url.match(/twitch\.tv\/([a-zA-Z0-9_]+)/);
+    return m ? m[1] : null;
+}
+
+// ---- Cleanup current player ----
+function cleanup() {
+    if (hlsInstance) { hlsInstance.destroy(); hlsInstance = null; }
+    if (currentPlayer && currentType === 'youtube' && currentPlayer.destroy) {
+        try { currentPlayer.destroy(); } catch(e) {}
+    }
+    container.innerHTML = '';
+    currentPlayer = null;
+    currentType = null;
+}
+
+// ---- Play: YouTube ----
+function playYouTube(opts) {
+    cleanup();
+    currentType = 'youtube';
+    const videoId = extractYouTubeId(opts.url);
+    if (!videoId) { console.error('Invalid YouTube URL:', opts.url); return; }
+
+    const div = document.createElement('div');
+    div.id = 'yt-player';
+    container.appendChild(div);
+
+    currentPlayer = new YT.Player('yt-player', {
+        videoId: videoId,
+        playerVars: {
+            autoplay: 1,
+            controls: 0,
+            disablekb: 1,
+            fs: 0,
+            modestbranding: 1,
+            rel: 0,
+            showinfo: 0,
+            iv_load_policy: 3,
+            start: Math.floor(opts.offset || 0),
+            loop: opts.loop ? 1 : 0,
+            playlist: opts.loop ? videoId : undefined,
+            origin: 'https://www.youtube.com',
+            enablejsapi: 1
+        },
+        events: {
+            onReady: function(e) {
+                e.target.setVolume(opts.volume || 100);
+                e.target.playVideo();
+                // Report duration to Lua
+                const dur = e.target.getDuration();
+                if (dur > 0) reportDuration(dur);
+            },
+            onStateChange: function(e) {
+                if (e.data === YT.PlayerState.ENDED && !opts.loop) {
+                    reportEnded();
+                }
+            }
+        }
+    });
+}
+
+// ---- Play: Twitch ----
+function playTwitch(opts) {
+    cleanup();
+    currentType = 'twitch';
+    const channel = extractTwitchChannel(opts.url);
+    if (!channel) { console.error('Invalid Twitch URL:', opts.url); return; }
+
+    const iframe = document.createElement('iframe');
+    iframe.src = `https://player.twitch.tv/?channel=${channel}&parent=cfx-nui-${RESOURCE}&muted=false&autoplay=true`;
+    iframe.allow = 'autoplay';
+    container.appendChild(iframe);
+    currentPlayer = iframe;
+}
+
+// ---- Play: HLS ----
+function playHLS(opts) {
+    cleanup();
+    currentType = 'hls';
+
+    loadHlsJs(function() {
+        const video = document.createElement('video');
+        video.autoplay = true;
+        video.loop = !!opts.loop;
+        container.appendChild(video);
+        currentPlayer = video;
+
+        if (Hls.isSupported()) {
+            hlsInstance = new Hls();
+            hlsInstance.loadSource(opts.url);
+            hlsInstance.attachMedia(video);
+            hlsInstance.on(Hls.Events.MANIFEST_PARSED, function() {
+                video.play().catch(e => console.warn(e));
+                if (opts.offset > 0) video.currentTime = opts.offset;
+            });
+        } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+            video.src = opts.url;
+            video.addEventListener('loadedmetadata', function() {
+                video.play().catch(e => console.warn(e));
+                if (opts.offset > 0) video.currentTime = opts.offset;
+            });
+        }
+
+        video.addEventListener('ended', function() {
+            if (!opts.loop) reportEnded();
+        });
+    });
+}
+
+// ---- Play: Direct Media ----
+function playDirect(opts) {
+    cleanup();
+    currentType = 'direct';
+
+    const video = document.createElement('video');
+    video.autoplay = true;
+    video.loop = !!opts.loop;
+    video.src = opts.url;
+    container.appendChild(video);
+    currentPlayer = video;
+
+    video.addEventListener('loadedmetadata', function() {
+        if (opts.offset > 0) video.currentTime = opts.offset;
+        if (video.duration > 0) reportDuration(video.duration);
+    });
+    video.addEventListener('ended', function() {
+        if (!opts.loop) reportEnded();
+    });
+
+    video.play().catch(e => console.warn(e));
+}
+
+// ---- Unified Play ----
+function play(opts) {
+    const type = opts.mediaType || detectType(opts.url);
+
+    switch (type) {
+        case 'youtube':
+            if (ytReady) { playYouTube(opts); }
+            else { pendingPlay = opts; pendingPlay.mediaType = 'youtube'; }
+            break;
+        case 'twitch':  playTwitch(opts); break;
+        case 'hls':     playHLS(opts); break;
+        default:        playDirect(opts); break;
+    }
+}
+
+// ---- Volume Control ----
+function setVolume(vol) {
+    const v = Math.max(0, Math.min(100, vol));
+    if (currentType === 'youtube' && currentPlayer && currentPlayer.setVolume) {
+        currentPlayer.setVolume(v);
+    } else if (currentPlayer && currentPlayer.volume !== undefined) {
+        currentPlayer.volume = v / 100;
+    }
+}
+
+// ---- Pause / Resume ----
+function setPaused(paused) {
+    if (currentType === 'youtube' && currentPlayer) {
+        paused ? currentPlayer.pauseVideo() : currentPlayer.playVideo();
+    } else if (currentPlayer) {
+        paused ? currentPlayer.pause() : currentPlayer.play().catch(e => console.warn(e));
+    }
+}
+
+// ---- Seek ----
+function seek(time) {
+    if (currentType === 'youtube' && currentPlayer && currentPlayer.seekTo) {
+        currentPlayer.seekTo(time, true);
+    } else if (currentPlayer) {
+        currentPlayer.currentTime = time;
+    }
+}
+
+// ---- Report back to Lua via NUI callback ----
+function reportDuration(dur) {
+    fetch(`https://${RESOURCE}/setDuration`, {
+        method: 'POST',
+        body: JSON.stringify({ id: MEDIA_ID, duration: Math.floor(dur) })
+    }).catch(() => {});
+}
+
+function reportEnded() {
+    // Server will handle this via duration check, but we can also notify
+}
+
+function reportReady() {
+    fetch(`https://${RESOURCE}/duiReady`, {
+        method: 'POST',
+        body: JSON.stringify({ id: MEDIA_ID })
+    }).catch(() => {});
+}
+
+// ---- Message Handler (from Lua via SendDuiMessage) ----
+window.addEventListener('message', function(event) {
+    const data = event.data;
+    if (!data || !data.type) return;
+
+    switch (data.type) {
+        case 'ping':
+            reportReady();
+            break;
+        case 'play':
+            play(data);
+            break;
+        case 'stop':
+            cleanup();
+            break;
+        case 'pause':
+            setPaused(true);
+            break;
+        case 'resume':
+            setPaused(false);
+            break;
+        case 'volume':
+            setVolume(data.volume);
+            break;
+        case 'seek':
+            seek(data.time);
+            break;
+    }
+});
+
+// Signal readiness immediately
+setTimeout(reportReady, 100);
+</script>
+</body>
+</html>
