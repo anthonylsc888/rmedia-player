@@ -173,7 +173,6 @@ function playHLS(opts) {
     loadHlsJs(function() {
         const video = document.createElement('video');
         video.autoplay = true;
-        video.muted = true; // Audio handled by NUI ReactPlayer
         video.loop = !!opts.loop;
         container.appendChild(video);
         currentPlayer = video;
@@ -203,7 +202,6 @@ function playDirect(opts) {
 
     const video = document.createElement('video');
     video.autoplay = true;
-    video.muted = true; // Audio handled by NUI ReactPlayer
     video.loop = !!opts.loop;
     video.src = opts.url;
     container.appendChild(video);
